@@ -7,14 +7,14 @@ namespace import ::tcltest::*
 tcl::tm::path add [file normalize [file dirname [info script]]]
 package require clip
 
-proc usageText {defs {sections {}}} {
-  set chan [file tempfile path]
-  ::clip::usage $defs $sections $chan
+proc usageText {defs {sections {}} {cmdpath {}}} {
+  set chan [file tempfile tmp]
+  ::clip::usage $defs $sections $chan $cmdpath
   close $chan
-  set chan [open $path r]
+  set chan [open $tmp r]
   set text [read $chan]
   close $chan
-  file delete $path
+  file delete $tmp
   return $text
 }
 
@@ -163,10 +163,10 @@ test clip-3.4 {unknown attribute is an error} -body {
   list $rc $msg [dict get $opt -errorCode]
 } -result {1 {unknown attribute garbage in option definition {{-v} -info x garbage y}} {CLIP baddef}}
 
-test clip-3.5 {descriptor without a leading dash is an error} -body {
-  set rc [catch {::clip::parse {} {{{a-b}}}} msg opt]
+test clip-3.5 {malformed option descriptor is an error} -body {
+  set rc [catch {::clip::parse {} {{{-=}}}} msg opt]
   list $rc $msg [dict get $opt -errorCode]
-} -result {1 {failed to decode option descriptor a-b} {CLIP baddef}}
+} -result {1 {failed to decode option descriptor -=} {CLIP baddef}}
 
 test clip-3.6 {definition without option descriptors is an error} -body {
   set rc [catch {::clip::parse {} {{{} -info nothing}}} msg opt]
@@ -217,5 +217,129 @@ test clip-4.3 {section matching is string exact} -body {
 test clip-5.1 {parse and usage are exported} -body {
   lsort [namespace eval ::clip {namespace export}]
 } -result {parse usage}
+
+# --- subcommands ------------------------------------------------------------
+
+set tooldefs {
+  {{-C= --directory=} -global 1 -slot dir -info {run as if started in dir}}
+  {{-v --verbose} -info {enable chatter}}
+  {remote -slot cmd1 -info {manage remotes} -defs {
+    {{-m --mirror} -slot mirror -info {mirror mode}}
+    {{-q --quiet} -global 1 -slot quiet -info {suppress output}}
+    {add -slot cmd2 -info {add a remote} -defs {
+      {{-f --force} -slot force -info {overwrite}}
+    }}
+    {remove -slot cmd2 -info {remove a remote}}
+  }}
+  {config -slot cmd1 -info {tweak settings} -defs {
+    {{--global} -info {touch the global config}}
+  }}
+}
+
+test clip-6.1 {subcommand selection and its own options} -body {
+  unset -nocomplain v cmd1 mirror
+  set pos [::clip::parse {-v remote -m} $tooldefs]
+  list $v $cmd1 $mirror $pos
+} -result {1 remote 1 {}}
+
+test clip-6.2 {two-level nesting with a global option} -body {
+  unset -nocomplain dir cmd1 cmd2 force
+  set pos [::clip::parse {-C /x remote add -f foo bar} $tooldefs]
+  list $dir $cmd1 $cmd2 $force $pos
+} -result {/x remote add 1 {foo bar}}
+
+test clip-6.3 {globals recognized after the command token and at depth} -body {
+  unset -nocomplain dir quiet mirror cmd1 cmd2 force
+  set pos [::clip::parse {remote -C /x -q -m} $tooldefs]
+  set a [list $dir $quiet $mirror $cmd1 $pos]
+  unset -nocomplain quiet force cmd2
+  set pos [::clip::parse {remote add -q -f x} $tooldefs]
+  list $a "$quiet $force $cmd2 $pos"
+} -result {{/x 1 1 remote {}} {1 1 add x}}
+
+test clip-6.4 {outer non-global options are retired below} -body {
+  set rc [catch {::clip::parse {remote -v} $tooldefs} msg]
+  list $rc $msg
+} -result {1 {unrecognized argument -v}}
+
+test clip-6.5 {multi spelling command, slot receives the chosen name} -body {
+  unset -nocomplain op
+  set pos [::clip::parse {co} {{{co checkout} -slot op}}]
+  set a [list $op $pos]
+  unset -nocomplain op
+  set pos [::clip::parse {checkout} {{{co checkout} -slot op}}]
+  list $a [list $op $pos]
+} -result {{co {}} {checkout {}}}
+
+test clip-6.6 {unknown command is an error} -body {
+  set rc [catch {::clip::parse {frobnicate} $tooldefs} msg opt]
+  list $rc $msg [dict get $opt -errorCode]
+} -result {1 {unknown command frobnicate} {CLIP badopt}}
+
+test clip-6.7 {-- ends command matching} -body {
+  unset -nocomplain cmd1
+  set pos [::clip::parse {-- remote} $tooldefs]
+  list [llength $pos] $pos [info exists cmd1]
+} -result {1 remote 0}
+
+test clip-6.8 {a lone dash and negative numbers consume the first positional slot} -body {
+  unset -nocomplain cmd1
+  set a [list [::clip::parse {- remote} $tooldefs] [info exists cmd1]]
+  unset -nocomplain cmd1
+  set b [list [::clip::parse {-3 remote} $tooldefs] [info exists cmd1]]
+  list $a $b
+} -result {{{- remote} 0} {{-3 remote} 0}}
+
+test clip-6.9 {global option colliding with the subcommand's own is an error} -body {
+  set rc [catch {::clip::parse {add} {
+    {{-v --verbose} -global 1}
+    {add -defs {{{-v --verbose}}}}
+  }} msg opt]
+  list $rc $msg [dict get $opt -errorCode]
+} -result {1 {global option -v conflicts with the subcommand's own option of the same name} {CLIP baddef}}
+
+test clip-6.10 {a global option defined at two levels is an error} -body {
+  set rc [catch {::clip::parse {sub} {
+    {{-g} -global 1 -slot a}
+    {sub -defs {{{-g} -global 1 -slot b}}}
+  }} msg opt]
+  list $rc $msg [dict get $opt -errorCode]
+} -result {1 {global option -g is defined more than once} {CLIP baddef}}
+
+test clip-6.11 {mixing command names and option descriptors is an error} -body {
+  set rc [catch {::clip::parse {} {{{add -f}}}} msg opt]
+  list $rc $msg [dict get $opt -errorCode]
+} -result {1 {cannot mix command names and option descriptors in one definition {{add -f}}} {CLIP baddef}}
+
+test clip-6.12 {command tokens past the first positional stay positional} -body {
+  unset -nocomplain cmd1 cmd2
+  set pos [::clip::parse {remote add x remote} $tooldefs]
+  list $cmd1 $cmd2 $pos
+} -result {remote add {x remote}}
+
+test clip-6.13 {usage lists commands and drills down a path} -body {
+  set a [usageText $tooldefs]
+  set b [usageText $tooldefs {} {remote add}]
+  list [string match {*\* Commands:*remote*manage remotes*config*tweak settings*} $a] \
+       [string match {*\* Generic options:*-f, --force*overwrite*} $b] \
+       [string match {*-C, --directory <arg>*} $b]
+} -result {1 1 1}
+
+test clip-6.14 {usage drilldown with an unknown command is an error} -body {
+  set rc [catch {usageText $tooldefs {} {remote nope}} msg opt]
+  list $rc $msg [dict get $opt -errorCode]
+} -result {1 {unknown command nope} {CLIP badopt}}
+
+test clip-6.15 {command -apply receives the chosen name} -body {
+  unset -nocomplain op
+  ::clip::parse {co} {{{co checkout} -slot op -apply {upvar 2 $slot y; set y cmd:$value}}}
+  set op
+} -result cmd:co
+
+test clip-6.16 {dash-containing bare names are commands} -body {
+  unset -nocomplain op
+  set pos [::clip::parse {a-b x} {{{a-b} -slot op}}]
+  list $op $pos
+} -result {a-b x}
 
 cleanupTests
